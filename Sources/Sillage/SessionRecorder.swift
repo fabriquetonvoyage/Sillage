@@ -58,12 +58,18 @@ final class SessionRecorder {
 
     // MARK: - Contrat avec l'interface
 
+    /// Niveau crête du micro (0…1), au plus ~15 fois par seconde.
+    var onLevel: ((Float) -> Void)?
     /// Appelé quand le device de capture disparaît ou se reconfigure.
     var onStreamInterrupted: (() -> Void)?
+    /// Vrai dès qu'un échantillon micro dépasse le seuil de signal. Non remis à
+    /// zéro par `cleanup()` : le verdict doit rester lisible après `stop()`.
+    private(set) var didHearSignal = false
     /// Vrai si le tap n'a jamais rien livré d'autre que du silence.
     private(set) var systemHeardNothing = true
     private(set) var micDeviceName: String?
 
+    private var lastLevelSent = Date.distantPast
     private var firstSampleLogged = false
     /// -40 dBFS : la parole dépasse largement, un flux mort jamais.
     private static let signalThreshold: Float = 0.01
@@ -81,8 +87,10 @@ final class SessionRecorder {
                captureSystem: Bool,
                micURL: URL,
                systemURL: URL) throws {
-systemHeardNothing = true
+        didHearSignal = false
+        systemHeardNothing = true
         firstSampleLogged = false
+        lastLevelSent = .distantPast
         micConverter = nil
         systemConverter = nil
         self.micURL = micURL
@@ -120,6 +128,7 @@ systemHeardNothing = true
             try openIO(mic: mic, captureSystem: wantsSystem)
             micConverter = try converter(from: micStageFormat, to: micFileFormat, label: "micro")
             systemConverter = try converter(from: systemLiveFormat, to: systemFileFormat, label: "système")
+            didHearSignal = false
             try startIO()
             Log.mic.notice("Micro basculé sur « \(self.micDeviceName ?? "?", privacy: .public) »")
         } catch {
@@ -299,7 +308,10 @@ systemHeardNothing = true
             let source = stage === live ? raw : Self.firstChannel(of: raw, as: stage)
             guard let source else { return }
             let out = converter.flatMap { Self.convert(source, with: $0, to: target) } ?? source
-            if !isMic, Self.peak(of: out) > Self.signalThreshold {
+            if isMic {
+                let peak = Self.peak(of: out)
+                report(level: peak)
+            } else if Self.peak(of: out) > Self.signalThreshold {
                 systemHeardNothing = false
             }
             do {
@@ -314,6 +326,13 @@ systemHeardNothing = true
         }
     }
 
+    private func report(level peak: Float) {
+        if peak > Self.signalThreshold { didHearSignal = true }
+        let now = Date()
+        guard now.timeIntervalSince(lastLevelSent) >= 1.0 / 15, let onLevel else { return }
+        lastLevelSent = now
+        DispatchQueue.main.async { onLevel(peak) }
+    }
 
     // MARK: - Surveillance du device
 

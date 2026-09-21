@@ -12,13 +12,18 @@ struct ContentView: View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Sillage").font(.headline)
 
-            Picker("Micro", selection: $controller.selectedInputUID) {
+            // Actif même pendant l'enregistrement : changer de micro en cours de
+            // route est précisément ce qu'on veut pouvoir faire quand on
+            // s'aperçoit que celui ouvert ne capte rien.
+            Picker("Micro", selection: Binding(
+                get: { controller.selectedInputUID },
+                set: { controller.switchInput(to: $0) }
+            )) {
                 Text("Défaut système").tag(String?.none)
                 ForEach(controller.inputDevices) { device in
                     Text(device.name).tag(String?.some(device.uid))
                 }
             }
-            .disabled(controller.isRecording)
 
             if controller.selectedInputMissing {
                 Label("Micro choisi débranché — le défaut système sera utilisé.",

@@ -75,6 +75,17 @@ final class RecordingController: ObservableObject {
     @Published private(set) var isTranscribing: Bool = false
     @Published private(set) var lastTranscriptionError: String?
     @Published private(set) var transcription: TranscriptionProgress?
+    /// Niveau crête du micro (0…1) pendant l'enregistrement, pour l'indicateur
+    /// du panneau flottant.
+    @Published private(set) var micLevel: Float = 0
+    /// Vrai quand le micro n'a rien capté depuis assez longtemps pour que ce
+    /// soit anormal : périphérique muet ou parole dans un autre micro.
+    @Published private(set) var micSeemsSilent: Bool = false
+
+    /// Verdict figé à l'arrêt, pour l'avertissement final.
+    private var micHeardNothing = false
+    /// Origine du compte à rebours « micro muet », repoussée à chaque bascule.
+    private var micSilenceSince: TimeInterval = 0
     /// Dernière réouverture automatique, pour ne pas boucler sur une rafale.
     private var lastInputReopen = Date.distantPast
 
@@ -140,6 +151,9 @@ final class RecordingController: ObservableObject {
         do {
             try recorder.switchMic(to: device)
             activeInputName = recorder.micDeviceName
+            micLevel = 0
+            micSeemsSilent = false
+            micSilenceSince = elapsed
             statusMessage = warning
         } catch {
             statusMessage = "Bascule micro impossible : \(error.localizedDescription)"
@@ -162,6 +176,13 @@ final class RecordingController: ObservableObject {
             sessionDir = dir
 
             let (micDevice, deviceWarning) = resolveInputDevice()
+            micLevel = 0
+            micSeemsSilent = false
+            micHeardNothing = false
+            micSilenceSince = 0
+            recorder.onLevel = { [weak self] level in
+                Task { @MainActor in self?.micLevel = level }
+            }
             recorder.onStreamInterrupted = { [weak self] in
                 Task { @MainActor in self?.reopenInput() }
             }
@@ -177,6 +198,10 @@ final class RecordingController: ObservableObject {
                 Task { @MainActor in
                     guard let self, let start = self.startDate else { return }
                     self.elapsed = Date().timeIntervalSince(start)
+                    // Au bout de 12 s sans le moindre signal, ce n'est plus un
+                    // blanc dans la conversation : le micro ne capte rien.
+                    self.micSeemsSilent = !self.recorder.didHearSignal
+                        && (self.elapsed - self.micSilenceSince) >= 12
                 }
             }
 
@@ -197,10 +222,17 @@ final class RecordingController: ObservableObject {
         timer?.invalidate()
         timer = nil
         recorder.stop()
-        // Lu après l'arrêt de l'IOProc : le verdict ne bougera plus.
+        // Lus après l'arrêt de l'IOProc : les verdicts ne bougeront plus.
+        micHeardNothing = !recorder.didHearSignal
         let systemHeardNothing = recorder.systemHeardNothing
+        recorder.onLevel = nil
         recorder.onStreamInterrupted = nil
+        micLevel = 0
+        micSeemsSilent = false
         activeInputName = nil
+        if micHeardNothing {
+            Log.mic.error("Piste micro muette : aucun signal capté de toute la session")
+        }
 
         isRecording = false
         let dir = sessionDir
@@ -366,7 +398,10 @@ final class RecordingController: ObservableObject {
             // si la transcription échoue).
             deleteAudio(at: [micURL, sysURL])
             let systemNote = systemCapturedNothing ? " · son système non capté" : ""
-            statusMessage = "Transcript prêt (\(count) segments) · audio supprimé\(systemNote)"
+            let micNote = micHeardNothing
+                ? " · ⚠️ micro muet : vérifie le périphérique sélectionné"
+                : ""
+            statusMessage = "Transcript prêt (\(count) segments) · audio supprimé\(systemNote)\(micNote)"
         } catch {
             // Une annulation volontaire n'est pas un échec : ni meta, ni erreur,
             // l'audio reste sur le disque. Toutes les erreurs remontées après
