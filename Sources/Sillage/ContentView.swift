@@ -12,13 +12,21 @@ struct ContentView: View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Sillage").font(.headline)
 
-            Picker("Micro", selection: $controller.selectedInputDeviceID) {
-                Text("Défaut système").tag(AudioDeviceID?.none)
+            Picker("Micro", selection: $controller.selectedInputUID) {
+                Text("Défaut système").tag(String?.none)
                 ForEach(controller.inputDevices) { device in
-                    Text(device.name).tag(AudioDeviceID?.some(device.id))
+                    Text(device.name).tag(String?.some(device.uid))
                 }
             }
             .disabled(controller.isRecording)
+
+            if controller.selectedInputMissing {
+                Label("Micro choisi débranché — le défaut système sera utilisé.",
+                      systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
 
             Toggle("Capturer le son système", isOn: $controller.captureSystemAudio)
                 .disabled(controller.isRecording)

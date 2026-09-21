@@ -23,6 +23,22 @@ if [ -z "${SIGN_ID}" ]; then
                 | awk -F'"' '/"/{print $2; exit}')"
 fi
 
+# Le SDK macOS 27 transforme @State en macro, mais les Command Line Tools ne
+# livrent pas libSwiftUIMacros.dylib (réservé à Xcode) : la compilation échoue
+# alors sur tout le code SwiftUI. Tant que le plugin manque, on se rabat sur le
+# SDK 26 s'il est encore installé. Le jour où Apple le fournit (ou si Xcode est
+# installé), ce bloc ne fait plus rien.
+if [ -z "${SDKROOT:-}" ] \
+   && [ ! -f "$(xcode-select -p)/usr/lib/swift/host/plugins/libSwiftUIMacros.dylib" ]; then
+    FALLBACK_SDK=$(ls -d "$(xcode-select -p)"/SDKs/MacOSX26*.sdk 2>/dev/null | sort -V | tail -1)
+    if [ -n "${FALLBACK_SDK}" ]; then
+        export SDKROOT="${FALLBACK_SDK}"
+        echo "==> libSwiftUIMacros absent des CLT — compilation avec ${SDKROOT##*/}"
+    else
+        echo "    ⚠️  libSwiftUIMacros absent et aucun SDK macOS 26 : la compilation va probablement échouer."
+    fi
+fi
+
 echo "==> Compilation (swift build -c ${CONFIG})"
 swift build -c "${CONFIG}"
 

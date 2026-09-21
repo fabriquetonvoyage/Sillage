@@ -32,6 +32,37 @@ enum AudioDeviceManager {
         stringProperty(id, kAudioObjectPropertyName)
     }
 
+    /// Retrouve un périphérique par son UID. Les `AudioDeviceID` sont réattribués
+    /// à chaque branchement : seul l'UID identifie durablement un micro.
+    static func device(withUID uid: String) -> AudioInputDevice? {
+        inputDevices().first { $0.uid == uid }
+    }
+
+    /// UID d'un périphérique : seul identifiant stable dans une description
+    /// d'agrégat, où les `AudioDeviceID` n'ont pas cours.
+    static func uid(of id: AudioDeviceID) -> String? {
+        stringProperty(id, kAudioDevicePropertyDeviceUID)
+    }
+
+    /// Nombre de canaux d'entrée par buffer, tel que l'IOProc les livrera.
+    /// `kAudioDevicePropertyStreamFormat` ne décrit que le **premier** flux :
+    /// sur un agrégat micro + tap il annonce 1 canal alors qu'il en arrive 3.
+    /// Seule la configuration fait foi.
+    static func inputChannelsPerBuffer(_ id: AudioDeviceID) -> [Int] {
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyStreamConfiguration,
+            mScope: kAudioObjectPropertyScopeInput,
+            mElement: kAudioObjectPropertyElementMain)
+        var size: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(id, &addr, 0, nil, &size) == noErr, size > 0 else { return [] }
+        let raw = UnsafeMutableRawPointer.allocate(
+            byteCount: Int(size), alignment: MemoryLayout<AudioBufferList>.alignment)
+        defer { raw.deallocate() }
+        guard AudioObjectGetPropertyData(id, &addr, 0, nil, &size, raw) == noErr else { return [] }
+        return UnsafeMutableAudioBufferListPointer(
+            raw.assumingMemoryBound(to: AudioBufferList.self)).map { Int($0.mNumberChannels) }
+    }
+
     /// Appelle `handler` sur la file principale à chaque branchement ou
     /// débranchement de périphérique. L'observation dure toute la vie de l'app.
     static func observeDeviceChanges(_ handler: @escaping () -> Void) {

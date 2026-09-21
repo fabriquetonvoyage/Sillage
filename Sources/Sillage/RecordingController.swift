@@ -44,7 +44,27 @@ struct TranscriptionProgress: Sendable, Equatable {
 @MainActor
 final class RecordingController: ObservableObject {
     @Published var inputDevices: [AudioInputDevice] = []
-    @Published var selectedInputDeviceID: AudioDeviceID? = nil
+
+    /// Micro choisi, identifié par son **UID** (stable) et non par son
+    /// `AudioDeviceID`, que Core Audio réattribue à chaque branchement.
+    /// `nil` = entrée par défaut du système.
+    ///
+    /// Persisté à dessein : sans ça, chaque relancement repartait sur le défaut
+    /// système — qu'un casque Bluetooth accapare en se connectant, au point
+    /// d'enregistrer un micro dans lequel l'utilisateur ne parle pas.
+    @Published var selectedInputUID: String? =
+        UserDefaults.standard.string(forKey: RecordingController.selectedInputKey) {
+        didSet {
+            UserDefaults.standard.set(selectedInputUID, forKey: Self.selectedInputKey)
+            updateSelectionAvailability()
+        }
+    }
+    private static let selectedInputKey = "selectedInputUID"
+
+    /// Nom du micro réellement ouvert pendant l'enregistrement.
+    @Published private(set) var activeInputName: String?
+    /// Vrai quand le micro choisi n'est plus branché.
+    @Published private(set) var selectedInputMissing = false
     @Published var captureSystemAudio: Bool = true
     @Published var isRecording: Bool = false
     @Published var statusMessage: String? = nil
@@ -55,9 +75,10 @@ final class RecordingController: ObservableObject {
     @Published private(set) var isTranscribing: Bool = false
     @Published private(set) var lastTranscriptionError: String?
     @Published private(set) var transcription: TranscriptionProgress?
+    /// Dernière réouverture automatique, pour ne pas boucler sur une rafale.
+    private var lastInputReopen = Date.distantPast
 
-    private let micRecorder = MicRecorder()
-    private var systemRecorder: SystemAudioRecorder?
+    private let recorder = SessionRecorder()
     private let floatingStop = FloatingStopController()
     private var timer: Timer?
     private var transcriptionTask: Task<Void, Never>?
@@ -77,8 +98,58 @@ final class RecordingController: ObservableObject {
         return String(format: "%02d:%02d", s / 60, s % 60)
     }
 
+    /// Le micro choisi est-il toujours branché ? On préfère le signaler plutôt
+    /// que de basculer en silence sur le défaut système.
+    private func updateSelectionAvailability() {
+        guard let uid = selectedInputUID else {
+            selectedInputMissing = false
+            return
+        }
+        selectedInputMissing = !inputDevices.contains { $0.uid == uid }
+    }
+
+    /// Traduit l'UID choisi en `AudioDeviceID`, au dernier moment : entre la
+    /// sélection et le démarrage, le périphérique a pu changer d'identifiant.
+    /// Renvoie aussi un avertissement à afficher si le micro a disparu.
+    private func resolveInputDevice() -> (AudioDeviceID?, String?) {
+        guard let uid = selectedInputUID else { return (nil, nil) }
+        if let device = AudioDeviceManager.device(withUID: uid) { return (device.id, nil) }
+        let name = inputDevices.first { $0.uid == uid }?.name ?? "Le micro choisi"
+        Log.mic.error("Micro sélectionné introuvable (uid \(uid, privacy: .public)) → défaut système")
+        return (nil, "« \(name) » est introuvable — enregistrement sur le micro par défaut.")
+    }
+
+    /// Le périphérique en cours a disparu ou s'est reconfiguré : on rouvre sur
+    /// le même choix. Le trou est comblé par du silence, donc l'alignement avec
+    /// la piste système tient. Débounce à 2 s : une reconfiguration arrive
+    /// souvent en rafale (Bluetooth qui renégocie son profil).
+    private func reopenInput() {
+        guard isRecording, Date().timeIntervalSince(lastInputReopen) > 2 else { return }
+        lastInputReopen = Date()
+        Log.mic.notice("Entrée interrompue → réouverture du micro")
+        switchInput(to: selectedInputUID)
+    }
+
+    /// Change de micro, y compris en pleine session : l'enregistrement continue
+    /// dans le même fichier. C'est la porte de sortie quand on s'aperçoit en
+    /// cours de route que le micro ouvert ne capte rien.
+    func switchInput(to uid: String?) {
+        selectedInputUID = uid
+        guard isRecording else { return }
+        let (device, warning) = resolveInputDevice()
+        do {
+            try recorder.switchMic(to: device)
+            activeInputName = recorder.micDeviceName
+            statusMessage = warning
+        } catch {
+            statusMessage = "Bascule micro impossible : \(error.localizedDescription)"
+            Log.mic.error("Bascule micro impossible : \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
     func refreshDevices() {
         inputDevices = AudioDeviceManager.inputDevices()
+        updateSelectionAvailability()
     }
 
     func toggle() {
@@ -90,21 +161,15 @@ final class RecordingController: ObservableObject {
             let dir = try makeSessionDir()
             sessionDir = dir
 
-            let micURL = dir.appendingPathComponent("mic.wav")
-            try micRecorder.start(deviceID: selectedInputDeviceID, to: micURL)
-
-            if captureSystemAudio {
-                let sysURL = dir.appendingPathComponent("system.wav")
-                let recorder = SystemAudioRecorder()
-                systemRecorder = recorder
-                Task {
-                    do {
-                        try await recorder.start(to: sysURL)
-                    } catch {
-                        self.statusMessage = "Son système indisponible : \(error.localizedDescription)"
-                    }
-                }
+            let (micDevice, deviceWarning) = resolveInputDevice()
+            recorder.onStreamInterrupted = { [weak self] in
+                Task { @MainActor in self?.reopenInput() }
             }
+            try recorder.start(micDevice: micDevice,
+                               captureSystem: captureSystemAudio,
+                               micURL: dir.appendingPathComponent("mic.wav"),
+                               systemURL: dir.appendingPathComponent("system.wav"))
+            activeInputName = recorder.micDeviceName
 
             startDate = Date()
             elapsed = 0
@@ -118,8 +183,9 @@ final class RecordingController: ObservableObject {
             isRecording = true
             activity = SessionActivity(dirName: dir.lastPathComponent, phase: .recording)
             // Le chrono du panneau dit déjà que ça tourne : on garde ce slot
-            // libre pour les vrais avertissements (son système indisponible…).
-            statusMessage = nil
+            // libre pour les vrais avertissements (micro introuvable, son
+            // système indisponible…).
+            statusMessage = deviceWarning
             floatingStop.show(controller: self)
         } catch {
             statusMessage = "Erreur au démarrage : \(error.localizedDescription)"
@@ -130,10 +196,12 @@ final class RecordingController: ObservableObject {
         floatingStop.hide()
         timer?.invalidate()
         timer = nil
-        micRecorder.stop()
+        recorder.stop()
+        // Lu après l'arrêt de l'IOProc : le verdict ne bougera plus.
+        let systemHeardNothing = recorder.systemHeardNothing
+        recorder.onStreamInterrupted = nil
+        activeInputName = nil
 
-        let recorder = systemRecorder
-        systemRecorder = nil
         isRecording = false
         let dir = sessionDir
         // Figés maintenant : les WAV seront supprimés, la durée ne serait plus retrouvable.
@@ -145,8 +213,7 @@ final class RecordingController: ObservableObject {
         statusMessage = "Transcription en cours…"
         isTranscribing = true
         transcriptionTask = Task {
-            await recorder?.stop()
-            let capturedNothing = recorder?.capturedNothing == true
+            let capturedNothing = systemRequested && systemHeardNothing
             if capturedNothing {
                 self.statusMessage = "Aucun son système capté — seule la piste micro sera transcrite."
             }
