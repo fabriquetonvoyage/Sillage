@@ -37,7 +37,10 @@ Command Line Tools.
 - 🕘 **Accès rapide** : les 10 derniers transcripts directement dans le panneau
   de la barre de menus, avec copie en un clic.
 - 🔴 **Panneau flottant** *Liquid Glass* avec bouton Stop, toujours visible
-  pendant l'enregistrement.
+  pendant l'enregistrement, avec **jauge de niveau** et le nom du micro
+  réellement ouvert — et une alerte si la piste reste muette.
+- 🔁 **Changement de micro en cours d'enregistrement**, sans interrompre la
+  session.
 - ⚠️ **Confirmation** avant de quitter l'application.
 
 ## Prérequis
