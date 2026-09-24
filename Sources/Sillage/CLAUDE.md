@@ -110,6 +110,11 @@ lexicographique de ces noms. Changer l'un impose de changer l'autre.
 - **Son système = Core Audio process taps**, pas ScreenCaptureKit : un tap global
   privé (`CATapDescription`) inséré dans l'agrégat privé, aux côtés du micro. C'est
   ce qui permet la permission « sons du système uniquement » sans permission d'écran.
+- **`kAudioAggregateDeviceTapAutoStartKey` doit être à `false`** dans notre
+  composition (micro = source d'horloge + tap). À `true`, l'IO attend que le tap
+  démarre, donc qu'une app joue du son : une session lancée dans le silence ne
+  captait rien, micro compris. Les exemples d'Apple et de la communauté le
+  mettent à `true`, mais pour un agrégat tap-only.
 - **L'agrégat tourne à la fréquence du micro** (sa source d'horloge) : un micro
   Bluetooth à 16 kHz ramène donc aussi la piste système à 16 kHz.
 - `cleanup()` doit détruire tap **et** device agrégé : ce sont des objets globaux

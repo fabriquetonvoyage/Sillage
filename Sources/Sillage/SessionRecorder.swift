@@ -52,6 +52,19 @@ final class SessionRecorder {
     private var micConverter: AVAudioConverter?
     private var systemConverter: AVAudioConverter?
 
+    /// Frames écrites de chaque côté. Les deux pistes doivent avancer du même
+    /// pas : un buffer vide d'un côté décalerait l'autre définitivement, et
+    /// l'écart grandit avec la durée de la session.
+    private var micFrames: Int64 = 0
+    private var systemFrames: Int64 = 0
+
+    /// Horloge de la session, pour combler un éventuel retard entre la demande
+    /// d'IO et le premier buffer (démarrage, bascule de micro). Sans comblement,
+    /// ce temps disparaîtrait et tout ce qui suit serait avancé.
+    private var sessionStartHost: UInt64 = 0
+    private var timebase = mach_timebase_info_data_t()
+    private var gapPending = false
+
     private var micURL: URL?
     private var systemURL: URL?
     private var wantsSystem = false
@@ -93,6 +106,10 @@ final class SessionRecorder {
         lastLevelSent = .distantPast
         micConverter = nil
         systemConverter = nil
+        micFrames = 0
+        systemFrames = 0
+        gapPending = false
+        mach_timebase_info(&timebase)
         self.micURL = micURL
         self.systemURL = systemURL
         self.wantsSystem = captureSystem
@@ -112,6 +129,8 @@ final class SessionRecorder {
                                          commonFormat: .pcmFormatFloat32, interleaved: fmt.isInterleaved)
         }
 
+        sessionStartHost = mach_absolute_time()
+        gapPending = true
         try startIO()
         Log.mic.notice("Session démarrée : micro « \(self.micDeviceName ?? "?", privacy: .public) » \(self.micLiveFormat?.channelCount ?? 0, privacy: .public) ch, système \(self.systemLiveFormat == nil ? "désactivé" : "activé", privacy: .public), \(Int(self.micLiveFormat?.sampleRate ?? 0), privacy: .public) Hz")
     }
@@ -120,26 +139,41 @@ final class SessionRecorder {
     /// du micro, il faut le reconstruire ; les fichiers, eux, restent ouverts et
     /// gardent leur format (conversion si le nouveau périphérique diffère).
     func switchMic(to chosen: AudioDeviceID?) throws {
-        let previous = (device: ioDevice, mic: micDeviceName)
+        let previous = (mic: micDeviceName, device: ioDevice)
         stopIO()
-        destroyAggregateAndTap()
+        destroyAggregate()
         do {
             let mic = try resolveMic(chosen)
             try openIO(mic: mic, captureSystem: wantsSystem)
             micConverter = try converter(from: micStageFormat, to: micFileFormat, label: "micro")
             systemConverter = try converter(from: systemLiveFormat, to: systemFileFormat, label: "système")
             didHearSignal = false
+            gapPending = true
             try startIO()
             Log.mic.notice("Micro basculé sur « \(self.micDeviceName ?? "?", privacy: .public) »")
         } catch {
-            Log.mic.error("Bascule impossible (\(error.localizedDescription, privacy: .public)) — micro précédent « \(previous.mic ?? "?", privacy: .public) » perdu")
+            // Plutôt qu'une session sourde, on rétablit le micro précédent.
+            Log.mic.error("Bascule impossible : \(error.localizedDescription, privacy: .public)")
+            if previous.device != AudioObjectID(kAudioObjectUnknown) {
+                ioDevice = previous.device
+                micDeviceName = previous.mic
+                try? startIO()
+                Log.mic.notice("Retour sur « \(previous.mic ?? "?", privacy: .public) »")
+            }
             throw error
         }
     }
 
     func stop() {
+        // Les compteurs restent lisibles après coup, alors que les WAV sont
+        // supprimés dès la transcription réussie : c'est la seule trace qui
+        // permette de vérifier que les deux pistes sont restées alignées.
+        let (mic, system) = (micFrames, systemFrames)
+        let rate = micFileFormat?.sampleRate ?? 48_000
+        let ticks = mach_absolute_time() &- sessionStartHost
+        let wall = Double(ticks) * Double(timebase.numer) / Double(timebase.denom) / 1e9
         cleanup()
-        Log.mic.notice("Session arrêtée")
+        Log.mic.notice("Session arrêtée — micro \(mic, privacy: .public) frames, système \(system, privacy: .public) frames (écart \(abs(mic - system), privacy: .public)) · audio \(String(format: "%.1f", Double(mic) / rate), privacy: .public) s pour \(String(format: "%.1f", wall), privacy: .public) s réelles")
     }
 
     // MARK: - Ouverture
@@ -188,14 +222,20 @@ final class SessionRecorder {
         systemLiveFormat = layout.count > 1 ? Self.format(channels: layout[1], rate: rate) : nil
     }
 
+    /// Le tap est **global et indépendant du micro** : on le crée une fois par
+    /// session et on le réutilise lors des bascules. Le détruire puis le
+    /// recréer aussitôt échoue (identifiant invalide rendu avec `noErr`), ce
+    /// qui faisait perdre la piste système pour le reste de la session.
     private func createTap() throws {
+        guard tapID == AudioObjectID(kAudioObjectUnknown) else { return }
         let desc = CATapDescription(stereoGlobalTapButExcludeProcesses: [])
         desc.name = "Sillage"
         desc.isPrivate = true
         var tap = AudioObjectID(kAudioObjectUnknown)
         let status = AudioHardwareCreateProcessTap(desc, &tap)
-        guard status == noErr, tap != AudioObjectID(kAudioObjectUnknown) else {
-            throw fail("AudioHardwareCreateProcessTap", status)
+        guard status == noErr else { throw fail("AudioHardwareCreateProcessTap", status) }
+        guard tap != AudioObjectID(kAudioObjectUnknown) else {
+            throw fail("AudioHardwareCreateProcessTap a rendu un identifiant invalide")
         }
         tapID = tap
         tapUUID = desc.uuid.uuidString
@@ -208,7 +248,12 @@ final class SessionRecorder {
             kAudioAggregateDeviceUIDKey: "com.cletetour.sillage.agg.\(tapUUID)",
             kAudioAggregateDeviceIsPrivateKey: true,
             kAudioAggregateDeviceIsStackedKey: false,
-            kAudioAggregateDeviceTapAutoStartKey: true,
+            // Surtout pas `true` : l'IO de l'agrégat attendrait alors que le tap
+            // démarre, c'est-à-dire qu'une app joue du son. Une session lancée
+            // dans le silence ne captait rien, micro compris, jusqu'au premier
+            // son système (mesuré : 0 callback en 3 s, contre un démarrage en
+            // ~90 ms à `false`, tap toujours fonctionnel).
+            kAudioAggregateDeviceTapAutoStartKey: false,
             // Le micro donne l'horloge : c'est lui qui cadence l'IOProc, donc le
             // tap livre des zéros pendant les silences au lieu de se taire.
             kAudioAggregateDeviceMainSubDeviceKey: micUID,
@@ -248,21 +293,26 @@ final class SessionRecorder {
         ioProcID = nil
     }
 
-    private func destroyAggregateAndTap() {
+    private func destroyAggregate() {
         if aggregateID != AudioObjectID(kAudioObjectUnknown) {
             AudioHardwareDestroyAggregateDevice(aggregateID)
             aggregateID = AudioObjectID(kAudioObjectUnknown)
         }
+        ioDevice = AudioObjectID(kAudioObjectUnknown)
+    }
+
+    private func destroyTap() {
         if tapID != AudioObjectID(kAudioObjectUnknown) {
             AudioHardwareDestroyProcessTap(tapID)
             tapID = AudioObjectID(kAudioObjectUnknown)
+            tapUUID = ""
         }
-        ioDevice = AudioObjectID(kAudioObjectUnknown)
     }
 
     private func cleanup() {
         stopIO()
-        destroyAggregateAndTap()
+        destroyAggregate()
+        destroyTap()
         micFile = nil
         systemFile = nil
         micLiveFormat = nil
@@ -282,15 +332,17 @@ final class SessionRecorder {
         let buffers = UnsafeMutableAudioBufferListPointer(
             UnsafeMutablePointer(mutating: data))
         guard buffers.count > 0 else { return }
+        if gapPending { fillSwitchGap(before: buffers[0]) }
 
         if let live = micLiveFormat, let stage = micStageFormat, let target = micFileFormat {
-            write(buffers[0], live: live, stage: stage, target: target,
-                  converter: micConverter, file: micFile, isMic: true)
+            micFrames += write(buffers[0], live: live, stage: stage, target: target,
+                               converter: micConverter, file: micFile, isMic: true)
         }
         if buffers.count > 1, let live = systemLiveFormat, let target = systemFileFormat {
-            write(buffers[1], live: live, stage: live, target: target,
-                  converter: systemConverter, file: systemFile, isMic: false)
+            systemFrames += write(buffers[1], live: live, stage: live, target: target,
+                                  converter: systemConverter, file: systemFile, isMic: false)
         }
+        equalizeTracks()
     }
 
     private func write(_ buffer: AudioBuffer,
@@ -299,14 +351,14 @@ final class SessionRecorder {
                        target: AVAudioFormat,
                        converter: AVAudioConverter?,
                        file: AVAudioFile?,
-                       isMic: Bool) {
-        guard let file, buffer.mDataByteSize > 0 else { return }
+                       isMic: Bool) -> Int64 {
+        guard let file, buffer.mDataByteSize > 0 else { return 0 }
         var abl = AudioBufferList(mNumberBuffers: 1, mBuffers: buffer)
-        withUnsafePointer(to: &abl) { ptr in
+        return withUnsafePointer(to: &abl) { ptr -> Int64 in
             guard let raw = AVAudioPCMBuffer(pcmFormat: live, bufferListNoCopy: ptr),
-                  raw.frameLength > 0 else { return }
+                  raw.frameLength > 0 else { return 0 }
             let source = stage === live ? raw : Self.firstChannel(of: raw, as: stage)
-            guard let source else { return }
+            guard let source else { return 0 }
             let out = converter.flatMap { Self.convert(source, with: $0, to: target) } ?? source
             if isMic {
                 let peak = Self.peak(of: out)
@@ -320,10 +372,72 @@ final class SessionRecorder {
                     Log.mic.notice("Premiers échantillons reçus → écriture OK")
                 }
                 try file.write(from: out)
+                return Int64(out.frameLength)
             } catch {
                 Log.mic.error("Erreur d'écriture : \(error.localizedDescription, privacy: .public)")
+                return 0
             }
         }
+    }
+
+    /// Comble les deux pistes jusqu'à la position réelle de la session, juste
+    /// avant le premier buffer qui suit un démarrage ou une bascule.
+    private func fillSwitchGap(before buffer: AudioBuffer) {
+        gapPending = false
+        guard let micFormat = micFileFormat, let live = micLiveFormat else { return }
+        let rate = micFormat.sampleRate
+        let ticks = mach_absolute_time() &- sessionStartHost
+        let elapsed = Double(ticks) * Double(timebase.numer) / Double(timebase.denom) / 1e9
+        // Le buffer reçu couvre déjà ses propres dernières millisecondes.
+        let bytesPerFrame = max(1, Int(live.channelCount)) * 4
+        let incoming = Double(Int(buffer.mDataByteSize) / bytesPerFrame) / live.sampleRate
+        let target = Int64((elapsed - incoming) * rate)
+        var filled: Int64 = 0
+        if target > micFrames, pad(micFile, format: micFormat, frames: target - micFrames) {
+            filled = target - micFrames
+            micFrames = target
+        }
+        if let sysFormat = systemFileFormat, target > systemFrames,
+           pad(systemFile, format: sysFormat, frames: target - systemFrames) {
+            systemFrames = target
+        }
+        Log.mic.notice("Retard d'IO comblé : \(String(format: "%.2f", Double(filled) / rate), privacy: .public) s")
+    }
+
+    /// Rattrape la piste en retard avec du silence. Sans ça, un buffer vide
+    /// d'un côté décale les deux pistes pour de bon — l'écart atteignait
+    /// 3 secondes sur une réunion d'une heure, et l'entrelacement des tours de
+    /// parole s'en ressentait sur la fin.
+    private func equalizeTracks() {
+        guard systemFile != nil else { return }
+        if micFrames < systemFrames,
+           let format = micFileFormat,
+           pad(micFile, format: format, frames: systemFrames - micFrames) {
+            micFrames = systemFrames
+        } else if systemFrames < micFrames,
+                  let format = systemFileFormat,
+                  pad(systemFile, format: format, frames: micFrames - systemFrames) {
+            systemFrames = micFrames
+        }
+    }
+
+    /// Écrit du silence par blocs d'une seconde, pour borner la mémoire sur un
+    /// long trou.
+    private func pad(_ file: AVAudioFile?, format: AVAudioFormat, frames: Int64) -> Bool {
+        guard let file, frames > 0 else { return false }
+        let chunk = Int64(format.sampleRate)
+        var remaining = frames
+        while remaining > 0 {
+            let n = AVAudioFrameCount(min(remaining, chunk))
+            guard let silence = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: n) else { return false }
+            silence.frameLength = n
+            for b in UnsafeMutableAudioBufferListPointer(silence.mutableAudioBufferList) {
+                if let data = b.mData { memset(data, 0, Int(b.mDataByteSize)) }
+            }
+            do { try file.write(from: silence) } catch { return false }
+            remaining -= Int64(n)
+        }
+        return true
     }
 
     private func report(level peak: Float) {

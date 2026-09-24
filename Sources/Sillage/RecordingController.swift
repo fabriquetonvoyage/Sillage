@@ -147,6 +147,9 @@ final class RecordingController: ObservableObject {
     func switchInput(to uid: String?) {
         selectedInputUID = uid
         guard isRecording else { return }
+        // Reconstruire l'agrégat fait réagir le surveillant de périphérique :
+        // sans armer le garde-fou ici, il relancerait aussitôt une bascule.
+        lastInputReopen = Date()
         let (device, warning) = resolveInputDevice()
         do {
             try recorder.switchMic(to: device)
